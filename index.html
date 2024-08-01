@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Document</title>
+  </head>
+  <body>
+    <script>
+      const bucket = new WeakMap();
+      let activeEffect = undefined;
+      // effect栈
+      const effectStack = [];
+      function effect(fn) {
+        const effectFn = () => {
+          cleanup(effectFn);
+          activeEffect = effectFn;
+          // 将副作用推入到栈中
+          effectStack.push(effectFn);
+          fn();
+          // 函数执行完毕将副作用函数推出栈
+          effectStack.pop();
+          // 让activeEffect执行effect栈的最上层
+          activeEffect = effectStack[effectStack.length - 1];
+        };
+        effectFn.deps = [];
+        effectFn();
+      }
+
+      function cleanup(effectFn) {
+        for (let i = 0; i < effectFn.deps.length; i++) {
+          const deps = effectFn.deps[i];
+          deps.delete(effectFn);
+        }
+        effectFn.deps.length = 0;
+      }
+
+      function track(target, key) {
+        // 没有副作用函数返回
+        if (!activeEffect) return;
+        // 该对象是否有副作用函数
+        let depsMap = bucket.get(target);
+        if (!depsMap) bucket.set(target, (depsMap = new Map()));
+        // 该属性是否有副作用函数
+        let deps = depsMap.get(key);
+        if (!deps) depsMap.set(key, (deps = new Set()));
+        // 将副作用函数和该属性进行绑定
+        deps.add(activeEffect);
+        // 将该属性的副作用桶绑定给该副作用
+        activeEffect.deps.push(deps);
+      }
+
+      function trigger(target, key) {
+        const depsMap = bucket.get(target);
+        if (!depsMap) return;
+        const deps = depsMap.get(key);
+        // 拷贝一份deps
+        const effectsToRun = new Set(deps);
+        effectsToRun.forEach((fn) => fn());
+      }
+
+      const obj = new Proxy(
+        { text: "hello", ok: true },
+        {
+          get(target, key) {
+            // 将副作用函数收集起来
+            track(target, key);
+            return target[key];
+          },
+          set(target, key, newValue) {
+            const setRes = Reflect.set(...arguments);
+            // 将副作用函数从桶中拿出来执行
+            trigger(target, key);
+            return setRes;
+          },
+        }
+      );
+
+      let temp1 = undefined;
+      let temp2 = undefined;
+      effect(function effectFn1() {
+        console.log("执行了effectFn1");
+        effect(function effectFn2() {
+          console.log("执行了effectFn2");
+          temp2 = obj.text;
+        });
+        temp1 = obj.ok;
+      });
+    </script>
+  </body>
+</html>

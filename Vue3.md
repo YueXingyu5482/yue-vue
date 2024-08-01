@@ -402,7 +402,7 @@ function track(target, key) {
   // 该属性是否有副作用函数
   let deps = depsMap.get(key)
   if(!deps) depsMap.set(key,(deps = new Set()))
-  // 将副作用函数和该副作用进行绑定
+  // 将副作用函数和该属性进行绑定
   deps.add(activeEffect)
 }
 
@@ -439,4 +439,173 @@ const obj = new Proxy({text: 'hello'},{
 ![image-20240731155344414](/Users/admin/Desktop/yue-vue/assets/image-20240731155344414.png)
 
 #### 4.4分支切换与cleanup
+
+我们已经实现了一个相对完善的响应式系统了，但是还有一些特殊的情况需要去处理，例如三元表达式的分支切换，以下面的代码为例
+
+```js
+effect(()=>{
+  document.body.innerText = obj.ok ? obj.text : 'none'
+})
+```
+
+在这个副作用函数中，我们期待的是obj的ok为true时，obj的text属性改变副作用函数重新执行一遍，当obj.ok为false的时候，obj.text改变，副作用函数不重新执行
+
+我们目前的响应式系统并不能实现这一需求，当obj.ok为true时，obj对象的ok和text属性都会绑定该副作用,obj.ok的值改为false后，重新执行副作用函数，obj的ok属性会绑定该副作用函数，**问题出现了**，这个时候并没有断开obj的text属性和副作用函数的绑定
+
+解决这一问题的方法很简单，我们只需要在副作用函数执行前，先断开之前的所有响应绑定，然后副作用函数执行，会重新绑定最新准确的依赖关系，以上面的例子为例，就是obj.ok更改为false，之后副作用函数清空响应绑定，也就是断开和obj.ok和obj.text的依赖关系，这样不管两个值接下来怎么改变都不会触发副作用函数的执行了，之后副作用函数执行，因为本次obj.ok的值为false，所以只会触发obj.ok的get，重新建立依赖
+
+好的解决逻辑已经有了，但是新的问题又出现了，就是我们怎么通过副作用函数知道它都和谁有依赖，我们之前的响应式系统都是单向的，也就是我们可以通过对象和对象的属性定位到这个属性的副作用函数，没有办法反向定位，所以我们要重新设计一些我们的副作用函数effect，处理方法如下
+
+```js
+// 原
+let activeEffect = undefined
+function effect (fn) {
+  activeEffect = fn
+  fn()
+}
+// 新
+let activeEffect = undefined
+function effect (fn) {
+  const effectFn = ()=> {
+    activeEffect = effectFn
+    fn()
+  }
+  effectFn.deps = []
+  effectFn()
+}
+```
+
+可以看到我们新写了一个effectFn函数，并将activeEffect指向了这个函数，可能有的人会疑惑，为什么要多次一举让activeEffect指向这个函数，直接等于fn不可以么，这是因为函数保存的也是引用地址，如果我们让activeEffect直接等于fn，后面挂载属性deps时会导致传入的函数fn上也同步修改了deps属性为空对象，破坏了传入的参数。
+
+现在我们的effect函数有了反向收集的地方了，我们只需要改写一下track函数，在进行对象的属性和副作用函数绑定的阶段进行双向绑定
+
+```js
+function track(target, key) {
+  // 没有副作用函数返回
+  if (!activeEffect) return
+  // 该对象是否有副作用函数
+  let depsMap = bucket.get(target)
+  if(!depsMap) bucket.set(target, (depsMap = new Map()))
+  // 该属性是否有副作用函数
+  let deps = depsMap.get(key)
+  if(!deps) depsMap.set(key,(deps = new Set()))
+  // 将副作用函数和该属性进行绑定
+  deps.add(activeEffect)
+  // 将该属性的副作用桶绑定给该副作用
+  activeEffect.deps.push(deps)
+}
+```
+
+现在我们已经可以通过副作用函数去找到对应都哪些桶中有它了，只要在执行前将它从这些桶中删除，副作用的执行发生在trigger，可以发现最后执行的是activeEffect，目前我们的activeEffect是一个函数，我们新写一个用于清除掉方法，cleanup，放在副作用函数执行前执行
+
+```js
+let activeEffect = undefined
+function effect (fn) {
+  const effectFn = ()=> {
+    cleanup(effectFn)
+    activeEffect = effectFn
+    fn()
+  }
+  effectFn.deps = []
+  effectFn()
+}
+```
+
+```js
+function cleanup (effectFn) {
+  for (let i=0;i<effectFn.deps.length;i++) {
+    const deps = effectFn.deps[i]
+    deps.delete(effectFn)
+  }
+  effectFn.deps.length = 0
+}
+```
+
+我们允许后发现页面卡死了，这是因为我们在执行阶段，也就是trigger使用的是deps.forEach的方法，在循环便利时，我们不断的对deps做delete和add，导致这个forEach一直运行，无限循环了，解决方法也很简单，我们在执行时将deps拷贝一份后再去执行就好了
+
+```js
+function trigger(target, key) {
+  const depsMap = bucket.get(target)
+  if(!depsMap) return
+  const deps = depsMap.get(key)
+  // 拷贝一份deps
+  const effectsToRun = new Set(deps)
+  effectsToRun.forEach(fn=>fn())
+}
+```
+
+#### 4.5嵌套的effect与effect栈
+
+现在我们需要处理的问题是effect的嵌套问题，也就是在effect函数中又调用了effect函数，这是很有可能的事情，我们目前的系统副作用收集流程是这样的
+
+<img src="/Users/admin/Desktop/yue-vue/assets/image-20240801133729591.png" alt="image-20240801133729591" style="zoom:80%;" />
+
+其中修改全局activeeffect是一个很重要的环节，这关系着我们在响应式get环节绑定的副作用函数是否准确，当我们的effect函数发生潜逃关系的时候会导致我们的activeEffect指向不符合预期，以下面的代码为例
+
+```js
+let temp1 = undefined
+let temp2 = undefined
+effect(function effectFn1() {
+  console.log('执行了effectFn1')
+  effect(function effectFn2() {console.log('执行了effectFn2'); temp2 = obj.text})
+  temp1 = obj.ok
+})
+```
+
+我们修改obj.ok的值，控制台可以看到打印了**执行了effectFn2**
+
+```js
+// effect运行的打印
+执行了effectFn1
+执行了effectFn2
+// obj.ok = false
+执行了effectFn2
+// obj.text = 'hh'
+执行了effectFn2
+```
+
+可以看到不论是obj.ok还是obj.text绑定的副作用函数都是effectFn2，然而我们期待的是obj.ok绑定的副作用函数是effectFn1，obj.text绑定的副作用函数是effectFn2，造成这个的原因是什么呢，我们分析一下上面的effect执行过程中activeEffect的指向
+
+```js
+effect(function effectFn1() {
+  // effectFn1开始执行了，这时候activeEffect指向effectFn1
+  console.log('执行了effectFn1')
+  effect(function effectFn2() {
+    // effectFn2开始执行了，这时候activeEffect指向effectFn2
+   	 	console.log('执行了effectFn2')
+    // 这个时候触发了obj.text属性的读取触发响应式的get，依赖绑定obj.text和activeEffect绑定即effectFn2绑定
+    	temp2 = obj.text
+  	}
+  )
+  // effectFn2函数执行完毕，触发obj.ok属性的读取，触发响应式的get，进行依赖绑定obj.ok和activeEffect绑定即effectFn2绑定
+  temp1 = obj.ok
+})
+```
+
+通过上面的分析我们发现了问题所在，就是effectFn2函数在执行完毕后，activeEffect函数并没有重新指向回effectFn1，还停留在effectFn2，下面我们进行解决，
+
+js的函数任务执行是在一个栈结构中运行的，有着先入后出的特点，我们为effect也同样建立一个栈，并且让activeEffect始终指向这个effect栈的最上层，这样就可以保证我们的activeEffect是准确的了
+
+```js
+let activeEffect = undefined
+// effect栈
+const effectStack = []
+function effect (fn) {
+  const effectFn = ()=> {
+    cleanup(effectFn)
+    activeEffect = effectFn
+    // 将副作用推入到栈中
+    effectStack.push(effectFn)
+    fn()
+    // 函数执行完毕将副作用函数推出栈
+    effectStack.pop()
+    // 让activeEffect执行effect栈的最上层
+    activeEffect = effectStack[effectStack.length - 1]
+  }
+  effectFn.deps = []
+  effectFn()
+}
+```
+
+#### 4.6避免无限递归循环
 
