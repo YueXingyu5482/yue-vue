@@ -11,22 +11,26 @@
       let activeEffect = undefined;
       // effect栈
       const effectStack = [];
-      function effect(fn) {
+      function effect(fn, options = {}) {
         const effectFn = () => {
           cleanup(effectFn);
           activeEffect = effectFn;
           // 将副作用推入到栈中
           effectStack.push(effectFn);
-          fn();
+          // 新增返回函数的执行结果
+          const res = fn();
           // 函数执行完毕将副作用函数推出栈
           effectStack.pop();
           // 让activeEffect执行effect栈的最上层
           activeEffect = effectStack[effectStack.length - 1];
+          return res;
         };
+        effectFn.options = options;
         effectFn.deps = [];
-        effectFn();
+        // lazy为true则不执行
+        if (!options.lazy) effectFn();
+        return effectFn;
       }
-
       function cleanup(effectFn) {
         for (let i = 0; i < effectFn.deps.length; i++) {
           const deps = effectFn.deps[i];
@@ -54,9 +58,20 @@
         const depsMap = bucket.get(target);
         if (!depsMap) return;
         const deps = depsMap.get(key);
-        // 拷贝一份deps
-        const effectsToRun = new Set(deps);
-        effectsToRun.forEach((fn) => fn());
+        const effectsToRun = new Set();
+        deps &&
+          deps.forEach((effectFn) => {
+            if (effectFn !== activeEffect) {
+              effectsToRun.add(effectFn);
+            }
+          });
+        effectsToRun.forEach((fn) => {
+          if (fn.options.scheduler) {
+            fn.options.scheduler(fn);
+          } else {
+            fn();
+          }
+        });
       }
 
       const obj = new Proxy(
@@ -76,16 +91,38 @@
         }
       );
 
-      let temp1 = undefined;
-      let temp2 = undefined;
-      effect(function effectFn1() {
-        console.log("执行了effectFn1");
-        effect(function effectFn2() {
-          console.log("执行了effectFn2");
-          temp2 = obj.text;
+      function computed(getter) {
+        let value;
+        let dirty = true;
+        const effectFn = effect(getter, {
+          lazy: true,
+          scheduler() {
+            if (!dirty) {
+              dirty = true;
+              trigger(obj, "value");
+            }
+          },
         });
-        temp1 = obj.ok;
+        const obj = {
+          get value() {
+            if (dirty) {
+              value = effectFn();
+              dirty = false;
+              track(obj, "value");
+            }
+            return value;
+          },
+        };
+        return obj;
+      }
+      const com = computed(() => {
+        console.log("执行了有computed的effect函数");
+        return obj.text + obj.ok;
       });
+      effect(() => {
+        console.log(com.value);
+      });
+      setTimeout(() => (obj.text = "change"));
     </script>
   </body>
 </html>
