@@ -54,10 +54,11 @@
         activeEffect.deps.push(deps);
       }
 
-      function trigger(target, key) {
+      function trigger(target, key, type) {
         const depsMap = bucket.get(target);
         if (!depsMap) return;
         const deps = depsMap.get(key);
+        const iserateEffects = depsMap.get(ISERATE_KEY);
         const effectsToRun = new Set();
         deps &&
           deps.forEach((effectFn) => {
@@ -65,6 +66,15 @@
               effectsToRun.add(effectFn);
             }
           });
+        // 将与 ITERATE_KEY 相关联的副作用函数也添加到 effectsToRun
+        if (type === TriggerType.ADD || type === TriggerType.DELETE) {
+          iserateEffects &&
+            iserateEffects.forEach((effectFn) => {
+              if (effectFn !== activeEffect) {
+                effectsToRun.add(effectFn);
+              }
+            });
+        }
         effectsToRun.forEach((fn) => {
           if (fn.options.scheduler) {
             fn.options.scheduler(fn);
@@ -74,23 +84,48 @@
         });
       }
 
+      const ISERATE_KEY = Symbol();
+
+      const TriggerType = {
+        ADD: "ADD",
+        SET: "SET",
+        DELETE: "DELETE",
+      };
+
       const obj = new Proxy(
         { text: "hello", ok: true },
         {
-          get(target, key) {
-            // 将副作用函数收集起来
+          get(target, key, receiver) {
             track(target, key);
-            return target[key];
+            return Reflect.get(target, key, receiver);
           },
-          set(target, key, newValue) {
-            const setRes = Reflect.set(...arguments);
-            // 将副作用函数从桶中拿出来执行
-            trigger(target, key);
+          set(target, key, newValue, receiver) {
+            const type = Object.prototype.hasOwnProperty.call(target, key)
+              ? TriggerType.SET
+              : TriggerType.ADD;
+            const setRes = Reflect.set(target, key, newValue, receiver);
+            trigger(target, key, type);
             return setRes;
+          },
+          has(target, key) {
+            track(target, key);
+            return Reflect.has(target, key);
+          },
+          ownKeys(target) {
+            track(target, ISERATE_KEY);
+            return Reflect.ownKeys(target);
+          },
+          deleteProperty(target, key) {
+            const hasKey = Object.prototype.hasOwnProperty.call(target, key);
+            const res = Reflect.deleteProperty(target, key);
+            if (res && hasKey) {
+              trigger(target, key, TriggerType.DELETE);
+            }
+            return res;
           },
         }
       );
-
+      // computed
       function computed(getter) {
         let value;
         let dirty = true;
@@ -115,14 +150,40 @@
         };
         return obj;
       }
-      const com = computed(() => {
-        console.log("执行了有computed的effect函数");
-        return obj.text + obj.ok;
-      });
+      // watch
+      function traverse(value, seen = new Set()) {
+        if (typeof value !== "object" || value === null || seen.has(value)) {
+          return;
+        }
+        // 主要防止对象的循环引用
+        seen.add(value);
+        for (let k in value) {
+          traverse(value[k], seen);
+        }
+        return value;
+      }
+      function watch(source, cb) {
+        let getter;
+        let oldValue, newValue;
+        if (typeof source === "function") getter = source;
+        else getter = () => traverse(source);
+        const effectFn = effect(getter, {
+          scheduler() {
+            newValue = effectFn();
+            cb(oldValue, newValue);
+            oldValue = newValue;
+          },
+          lazy: true,
+        });
+        oldValue = effectFn();
+      }
+      //test
       effect(() => {
-        console.log(com.value);
+        console.log("触发了");
+        for (const k in obj) {
+          k;
+        }
       });
-      setTimeout(() => (obj.text = "change"));
     </script>
   </body>
 </html>
